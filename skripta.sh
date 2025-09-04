@@ -2,69 +2,112 @@
 set -euo pipefail
 
 # ──────────────────────────────
-# Konfiguracija (možeš overrideati preko env varijabli)
+# Konfiguracija (editiraj po potrebi)
 # ──────────────────────────────
-CSV_FILE="${1:-users.csv}"                     # CSV: ime;prezime;rola
-EXT_NET="${EXT_NET:-provider-datacentre}"      # vanjska mreža (RHEL lab: provider-datacentre)
-IMAGE="${IMAGE:-}"                              # ako ostaviš prazno, auto-detekcija ispod
-FLAVOR="${FLAVOR:-m1.small}"                    # ~1 vCPU / 1GB (prilagodi)
-VOL_SIZE_GB="${VOL_SIZE_GB:-5}"                 # veličina dodatnih diskova
-ADMIN_USER="${ADMIN_USER:-azureuser}"           # korisnik na VM-ovima
-LAB_PASSWORD="${LAB_PASSWORD:-ChangeMe!123}"    # lab password (isti za sve)
-KEYPAIR="${KEYPAIR:-}"                          # opcionalno: OpenStack keypair ime
+CSV_FILE="${1:-users.csv}"          # CSV: ime;prezime;rola
+EXT_NET="${EXT_NET:-provider-datacentre}"  # external network (floating IP / router gw)
+IMAGE="${IMAGE:-}"                  # ako ostaviš prazno, auto-pickat će rhel9->rhel8->ubuntu-22.04
+FLAVOR="${FLAVOR:-default}"        # ~1 vCPU/1GB (prilagodi)
+VOL_SIZE_GB="${VOL_SIZE_GB:-5}"     # veličina svakog dodatnog diska
+ADMIN_USER="${ADMIN_USER:-admin}"  #admin korisnik na VM-ovima
+LAB_PASSWORD="${LAB_PASSWORD:-ChangeMe!123}"  # zajednički lab pass
+KEYPAIR="${KEYPAIR:-}"              # opciono: --key-name
 ROUTER_NAME="${ROUTER_NAME:-course-router}"
-DNS_NS="${DNS_NS:-8.8.8.8}"                     # npr. 172.25.250.254 u labu
+BOOT_FROM_VOLUME="${BOOT_FROM_VOLUME:-false}"
+BOOT_VOLUME_SIZE_GB="${BOOT_VOLUME_SIZE_GB:-10}"
 
-# HUB (instruktorska mreža)
+# HUB mreža (instruktorski subnet; koristi se kao “whitelist” za pristup studentima)
 HUB_NET="hub-net"
 HUB_SUBNET="hub-subnet"
 HUB_CIDR="10.90.1.0/24"
+DNS_NS="${DNS_NS:-8.8.8.8}"
 
 # ──────────────────────────────
 # Helpers
 # ──────────────────────────────
-need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing command: $1"; exit 1; }; }
-need_cmd openstack
-need_cmd awk
-need_cmd sed
-need_cmd tr
-need_cmd mktemp
+need_cmd(){ command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing command: $1"; exit 1; }; }
+need_cmd openstack; need_cmd awk; need_cmd sed; need_cmd tr; need_cmd mktemp
 
-safe() { echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-20; }
+safe(){ echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-20; }
 addr_block(){ local i="$1"; echo "10.91.${i}.0/24"; }
-app_prefix(){ local i="$1"; echo "10.91.${i}.0/25"; }
+app_prefix(){  local i="$1"; echo "10.91.${i}.0/25"; }
 jump_prefix(){ local i="$1"; echo "10.91.${i}.128/26"; }
 
-os_id() { local type="$1" name="$2"; openstack $type show "$name" -f value -c id 2>/dev/null || true; }
+os_id(){ openstack "$1" show "$2" -f value -c id 2>/dev/null || true; }
 
-# Odaberi image ako korisnik nije dao ili ako zadani ne postoji
-auto_pick_image() {
-  local wanted="$1"
-  if [[ -n "$wanted" ]]; then
-    if openstack image show "$wanted" >/dev/null 2>&1; then echo "$wanted"; return 0; fi
-    echo "[!] IMAGE '$wanted' not found — trying auto-detect..." >&2
-  fi
-  local names; names="$(openstack image list --status active -f value -c Name || true)"
-  [[ -z "$names" ]] && { echo "[!] No images found in Glance." >&2; return 1; }
-
-  # preferiraj RHEL, zatim Rocky/Alma, pa Ubuntu
-  local try_pats=(
-    "rhel.*9|rhel9" "rhel.*8|rhel8"
-    "rocky.*9" "almalinux.*9"
-    "ubuntu.*22.04|jammy" "ubuntu.*20.04|focal"
-    "debian.*12" "fedora"
-  )
-  local img
-  for pat in "${try_pats[@]}"; do
-    img="$(echo "$names" | grep -E -i "$pat" | head -n1 || true)"
-    [[ -n "$img" ]] && { echo "$img"; return 0; }
+# ---- čekanja ---------------------------------------------------------------
+wait_server_active(){
+  local name="$1" timeout="${2:-900}" start=$(date +%s)
+  echo "[i] Waiting for server $name to become ACTIVE..."
+  while true; do
+    local st ts vm
+    st=$(openstack server show "$name" -f value -c status 2>/dev/null || echo "")
+    ts=$(openstack server show "$name" -f value -c "OS-EXT-STS:task_state" 2>/dev/null | tr -d '\r' || true)
+    vm=$(openstack server show "$name" -f value -c "OS-EXT-STS:vm_state" 2>/dev/null | tr -d '\r' || true)
+    [[ -z "$st" ]] && st="N/A"; [[ -z "$ts" ]] && ts="None"; [[ -z "$vm" ]] && vm="N/A"
+    echo "    -> status=${st} task=${ts} vm_state=${vm}"
+    if [[ "$st" == "ACTIVE" && "$ts" == "None" ]]; then return 0; fi
+    if [[ "$st" == "ERROR" ]]; then echo "[!] $name ended in ERROR"; return 1; fi
+    (( $(date +%s) - start > timeout )) && { echo "[!] timeout waiting $name ACTIVE"; return 1; }
+    sleep 5
   done
-  img="$(echo "$names" | head -n1)"
-  echo "$img"
 }
 
+wait_volume_status(){
+  local vol="$1" want="${2:-available}" timeout="${3:-300}" start=$(date +%s)
+  echo "[i] Waiting volume $vol -> $want ..."
+  while openstack volume show "$vol" >/dev/null 2>&1; do
+    local st; st=$(openstack volume show "$vol" -f value -c status 2>/dev/null || echo "")
+    echo "    -> status=$st"
+    [[ "$st" == "$want" ]] && return 0
+    [[ "$st" =~ ^error ]] && { echo "[!] volume $vol in error ($st)"; return 1; }
+    (( $(date +%s) - start > timeout )) && { echo "[!] timeout waiting $vol -> $want"; return 1; }
+    sleep 3
+  done
+  return 0
+}
+
+# ---- SG helpers (idempotent + wait) ----------------------------------------
+ensure_sg(){
+  local sg="$1"
+  if [[ -z "$(os_id 'security group' "$sg")" ]]; then
+    openstack security group create "$sg" >/dev/null
+  fi
+  # pričekaj da se SG pojavi (race fix)
+  for i in {1..20}; do
+    openstack security group show "$sg" >/dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  return 0
+}
+
+ensure_rule(){
+  local sg="$1" dir="$2" proto="$3" port="$4" remote="$5"
+  openstack security group rule create --"$dir" --protocol "$proto" \
+    ${port:+--dst-port "$port"} ${remote:+--remote-ip "$remote"} "$sg" >/dev/null 2>&1 || true
+}
+
+create_secgroups_for_student(){
+  local student="$1" app_cidr="$2" jump_cidr="$3"
+  local sg_jump="sg-jump-${student}"
+  local sg_app="sg-app-${student}"
+
+  ensure_sg "$sg_jump"
+  ensure_rule "$sg_jump" ingress tcp 22 "0.0.0.0/0"
+  ensure_rule "$sg_jump" egress  ""  ""  ""
+
+  ensure_sg "$sg_app"
+  ensure_rule "$sg_app" ingress tcp 22 "$jump_cidr"
+  ensure_rule "$sg_app" ingress tcp 80 "$jump_cidr"
+  ensure_rule "$sg_app" ingress tcp 22 "$HUB_CIDR"
+  ensure_rule "$sg_app" ingress tcp 80 "$HUB_CIDR"
+  ensure_rule "$sg_app" egress  ""  ""  ""
+}
+
+# ---- mreža / router ---------------------------------------------------------
 ensure_router() {
-  local rid; rid=$(os_id router "$ROUTER_NAME")
+  local rid
+  rid=$(os_id router "$ROUTER_NAME")
   if [[ -z "$rid" ]]; then
     echo "[i] Creating router $ROUTER_NAME"
     openstack router create "$ROUTER_NAME" >/dev/null
@@ -86,132 +129,12 @@ ensure_hub_net() {
     openstack subnet create "$HUB_SUBNET" --network "$HUB_NET" \
       --subnet-range "$HUB_CIDR" --dns-nameserver "$DNS_NS" >/dev/null
     echo "[i] Attaching $HUB_SUBNET to router $ROUTER_NAME"
-    openstack router add subnet "$ROUTER_NAME" "$HUB_SUBNET" >/dev/null || true
+    openstack router add subnet "$ROUTER_NAME" "$HUB_SUBNET" >/dev/null
   fi
-}
-
-make_cloud_init_wp() {
-  local studuser="$1" out="$2"
-  cat > "$out" <<'CLOUD'
-#cloud-config
-ssh_pwauth: true
-chpasswd:
-  list: |
-    __ADMIN__:__PASS__
-    __STUDUSER__:__PASS__
-  expire: false
-
-write_files:
-  - path: /etc/nginx/wordpress.conf
-    content: |
-      server {
-        listen 80 default_server;
-        listen [::]:80 default_server;
-        root /var/www/html;
-        index index.php index.html index.htm;
-        server_name _;
-        location / { try_files $uri $uri/ /index.php?$args; }
-        location ~ \.php$ {
-          include fastcgi_params;
-          include snippets/fastcgi-php.conf;
-          fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-          fastcgi_pass unix:/run/php/php-fpm.sock;  # bit će zamijenjeno na /run/php-fpm/www.sock na RHEL-u
-        }
-        location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ { expires max; log_not_found off; }
-      }
-
-runcmd:
-  # 1) paketi (apt ili dnf)
-  - |
-    if command -v apt-get >/dev/null 2>&1; then
-      apt-get update -y
-      DEBIAN_FRONTEND=noninteractive apt-get install -y nginx php-fpm php-cli php-xml php-curl php-zip php-mbstring php-gd php-sqlite3 unzip
-    elif command -v dnf >/dev/null 2>&1; then
-      dnf -y module reset php || true
-      dnf -y module enable php:8.2 || true
-      dnf -y install nginx php php-fpm php-cli php-common php-gd php-mbstring php-xml php-json php-zip php-pdo php-sqlite3 unzip policycoreutils-python-utils || true
-    fi
-
-  # 2) ispravan nginx conf lokacija (Ubuntu sites-available vs RHEL conf.d)
-  - |
-    if [ -d /etc/nginx/sites-available ]; then
-      mv -f /etc/nginx/wordpress.conf /etc/nginx/sites-available/default
-    else
-      mv -f /etc/nginx/wordpress.conf /etc/nginx/conf.d/wordpress.conf
-    fi
-
-  # 3) zamijeni fastcgi socket ovisno o distro
-  - |
-    PHP_SOCK="/run/php/php-fpm.sock"
-    [ -e /run/php-fpm/www.sock ] && PHP_SOCK="/run/php-fpm/www.sock"
-    sed -ri "s#fastcgi_pass unix:.*sock;#fastcgi_pass unix:${PHP_SOCK};#" /etc/nginx/sites-available/default 2>/dev/null || true
-    sed -ri "s#fastcgi_pass unix:.*sock;#fastcgi_pass unix:${PHP_SOCK};#" /etc/nginx/conf.d/wordpress.conf 2>/dev/null || true
-
-  # 4) WordPress + SQLite plugin
-  - mkdir -p /var/www/html
-  - curl -L https://wordpress.org/latest.tar.gz -o /tmp/wp.tgz
-  - tar -xzf /tmp/wp.tgz -C /var/www/html --strip-components=1
-  - curl -L https://downloads.wordpress.org/plugin/sqlite-database-integration.latest-stable.zip -o /tmp/sqlite.zip
-  - unzip -o /tmp/sqlite.zip -d /var/www/html/wp-content/plugins
-  - cp /var/www/html/wp-content/plugins/sqlite-database-integration/db.copy /var/www/html/wp-content/db.php
-  - chown -R www-data:www-data /var/www/html || chown -R nginx:nginx /var/www/html || true
-
-  # 5) servisi
-  - systemctl enable --now php*-fpm || systemctl enable --now php-fpm || true
-  - systemctl enable --now nginx || true
-  - systemctl restart nginx || true
-CLOUD
-  sed -i "s|__ADMIN__|${ADMIN_USER}|g" "$out"
-  sed -i "s|__STUDUSER__|${studuser}|g" "$out"
-  sed -i "s|__PASS__|${LAB_PASSWORD}|g" "$out"
-}
-
-make_cloud_init_jump() {
-  local studuser="$1" out="$2"
-  cat > "$out" <<'CLOUD'
-#cloud-config
-ssh_pwauth: true
-chpasswd:
-  list: |
-    __ADMIN__:__PASS__
-    __STUDUSER__:__PASS__
-  expire: false
-runcmd:
-  - '[ -x /usr/bin/apt-get ] && (apt-get update -y; apt-get install -y htop tmux) || true'
-  - '[ -x /usr/bin/dnf ] && dnf install -y htop tmux || true'
-CLOUD
-  sed -i "s|__ADMIN__|${ADMIN_USER}|g" "$out"
-  sed -i "s|__STUDUSER__|${studuser}|g" "$out"
-  sed -i "s|__PASS__|${LAB_PASSWORD}|g" "$out"
-}
-
-create_secgroups_for_student() {
-  local student="$1" app_cidr="$2" jump_cidr="$3"
-  local sg_jump="sg-jump-${student}"
-  local sg_app="sg-app-${student}"
-
-  if [[ -z "$(os_id security group "$sg_jump")" ]]; then
-    openstack security group create "$sg_jump" >/dev/null
-  fi
-
-  if [[ -z "$(os_id security group "$sg_app")" ]]; then
-    openstack security group create "$sg_app" >/dev/null
-  fi
-
-  # JUMP: SSH s Interneta + egress
-  openstack security group rule create --ingress --protocol tcp --dst-port 22 --remote-ip 0.0.0.0/0 "$sg_jump" >/dev/null || true
-  openstack security group rule create --egress "$sg_jump" >/dev/null || true
-
-  # APP: dopušteno samo iz vlastitog JUMP subnet-a i HUB-a (SSH/HTTP) + egress
-  openstack security group rule create --ingress --protocol tcp --dst-port 22 --remote-ip "$jump_cidr" "$sg_app" >/dev/null || true
-  openstack security group rule create --ingress --protocol tcp --dst-port 80 --remote-ip "$jump_cidr" "$sg_app" >/dev/null || true
-  openstack security group rule create --ingress --protocol tcp --dst-port 22 --remote-ip "$HUB_CIDR" "$sg_app" >/dev/null || true
-  openstack security group rule create --ingress --protocol tcp --dst-port 80 --remote-ip "$HUB_CIDR" "$sg_app" >/dev/null || true
-  openstack security group rule create --egress "$sg_app" >/dev/null || true
 }
 
 create_network_for_student() {
-  local student="$1" _vnet_cidr="$2" app_cidr="$3" jump_cidr="$4"
+  local student="$1" vnet_cidr="$2" app_cidr="$3" jump_cidr="$4"
   local net="stu-${student}-net"
   local app_sn="app-${student}-subnet"
   local jump_sn="jump-${student}-subnet"
@@ -225,40 +148,165 @@ create_network_for_student() {
     echo "[i] Creating subnet $app_sn ($app_cidr)"
     openstack subnet create "$app_sn" --network "$net" \
       --subnet-range "$app_cidr" --dns-nameserver "$DNS_NS" >/dev/null
-    openstack router add subnet "$ROUTER_NAME" "$app_sn" >/dev/null || true
+    openstack router add subnet "$ROUTER_NAME" "$app_sn" >/dev/null
   fi
 
   if [[ -z "$(os_id subnet "$jump_sn")" ]]; then
     echo "[i] Creating subnet $jump_sn ($jump_cidr)"
     openstack subnet create "$jump_sn" --network "$net" \
       --subnet-range "$jump_cidr" --dns-nameserver "$DNS_NS" >/dev/null
-    openstack router add subnet "$ROUTER_NAME" "$jump_sn" >/dev/null || true
+    openstack router add subnet "$ROUTER_NAME" "$jump_sn" >/dev/null
   fi
 }
 
+# ---- cloud-init -------------------------------------------------------------
+make_cloud_init_jump() {
+  local studuser="$1" out="$2"
+  cat > "$out" <<'CLOUD'
+#cloud-config
+ssh_pwauth: true
+disable_root: true
+package_update: true
+packages: [ htop, tmux ]
+runcmd:
+  # ensure users exist
+  - id -u __ADMIN__ >/dev/null 2>&1 || useradd -m -s /bin/bash __ADMIN__
+  - id -u __STUDUSER__ >/dev/null 2>&1 || useradd -m -s /bin/bash __STUDUSER__
+  # set passwords
+  - bash -lc 'echo "__ADMIN__:__PASS__" | chpasswd'
+  - bash -lc 'echo "__STUDUSER__:__PASS__" | chpasswd'
+  # sudo (wheel na RHEL, sudo na Ubuntu)
+  - usermod -aG wheel __ADMIN__  || true
+  - usermod -aG wheel __STUDUSER__ || true
+  - usermod -aG sudo  __ADMIN__  || true
+  - usermod -aG sudo  __STUDUSER__ || true
+  # enforce password SSH
+  - sed -ri 's/^#?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+  - systemctl restart sshd || systemctl restart ssh || true
+CLOUD
+  sed -i "s|__ADMIN__|${ADMIN_USER}|g" "$out"
+  sed -i "s|__STUDUSER__|${studuser}|g" "$out"
+  sed -i "s|__PASS__|${LAB_PASSWORD}|g" "$out"
+}
+
+make_cloud_init_wp() {
+  local studuser="$1" out="$2"
+  cat > "$out" <<'CLOUD'
+#cloud-config
+ssh_pwauth: true
+disable_root: true
+package_update: true
+packages:
+  - nginx
+  - php-fpm
+  - php-cli
+  - php-xml
+  - php-curl
+  - php-zip
+  - php-mbstring
+  - php-gd
+  - php-sqlite3
+  - unzip
+write_files:
+  - path: /etc/nginx/conf.d/default.conf
+    content: |
+      server {
+        listen 80 default_server;
+        listen [::]:80 default_server;
+        root /var/www/html;
+        index index.php index.html index.htm;
+        server_name _;
+        location / { try_files $uri $uri/ /index.php?$args; }
+        location ~ \.php$ {
+          include /etc/nginx/fastcgi.conf;
+          fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+          fastcgi_pass unix:/run/php/php-fpm.sock;
+        }
+        location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ { expires max; log_not_found off; }
+      }
+runcmd:
+  # ensure users exist
+  - id -u __ADMIN__ >/dev/null 2>&1 || useradd -m -s /bin/bash __ADMIN__
+  - id -u __STUDUSER__ >/dev/null 2>&1 || useradd -m -s /bin/bash __STUDUSER__
+  # set passwords
+  - bash -lc 'echo "__ADMIN__:__PASS__" | chpasswd'
+  - bash -lc 'echo "__STUDUSER__:__PASS__" | chpasswd'
+  # sudo groups
+  - usermod -aG wheel __ADMIN__  || true
+  - usermod -aG wheel __STUDUSER__ || true
+  - usermod -aG sudo  __ADMIN__  || true
+  - usermod -aG sudo  __STUDUSER__ || true
+  # enforce password SSH
+  - sed -ri 's/^#?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+  - systemctl restart sshd || systemctl restart ssh || true
+  # PHP sock path fix (RHEL/Ubuntu agnostic)
+  - 'PHP_SOCK=$(ls /run/php/php*-fpm.sock /var/run/php-fpm/www.sock 2>/dev/null | head -n1 || echo /run/php/php8.1-fpm.sock); sed -ri "s#fastcgi_pass unix:.*fpm\.sock;#fastcgi_pass unix:${PHP_SOCK};#" /etc/nginx/conf.d/default.conf || true'
+  # WordPress + SQLite plugin
+  - mkdir -p /var/www/html
+  - curl -L https://wordpress.org/latest.tar.gz -o /tmp/wp.tgz
+  - tar -xzf /tmp/wp.tgz -C /var/www/html --strip-components=1
+  - curl -L https://downloads.wordpress.org/plugin/sqlite-database-integration.latest-stable.zip -o /tmp/sqlite.zip
+  - unzip -o /tmp/sqlite.zip -d /var/www/html/wp-content/plugins
+  - cp /var/www/html/wp-content/plugins/sqlite-database-integration/db.copy /var/www/html/wp-content/db.php
+  - chown -R nginx:nginx /var/www/html || chown -R www-data:www-data /var/www/html || true
+  - systemctl enable --now php*-fpm || systemctl enable --now php-fpm || systemctl enable --now php8.1-fpm || true
+  - systemctl restart nginx || systemctl restart nginx.service || true
+CLOUD
+  sed -i "s|__ADMIN__|${ADMIN_USER}|g" "$out"
+  sed -i "s|__STUDUSER__|${studuser}|g" "$out"
+  sed -i "s|__PASS__|${LAB_PASSWORD}|g" "$out"
+}
+
+# ---- server boot preko PORTA (port-id) --------------------------------------
 boot_server() {
   local name="$1" net="$2" subnet="$3" sg="$4" user_data="$5"
+
   local net_id sub_id
   net_id=$(openstack network show "$net" -f value -c id)
   sub_id=$(openstack subnet show "$subnet" -f value -c id)
 
-  local args=(--image "$IMAGE" --flavor "$FLAVOR" --security-group "$sg" --nic "net-id=${net_id},subnet-id=${sub_id}" --user-data "$user_data")
-  [[ -n "$KEYPAIR" ]] && args+=(--key-name "$KEYPAIR")
+  local port="port-${name}"
+  if ! openstack port show "$port" >/dev/null 2>&1; then
+    echo "[i] Creating port ${port} on ${net}/${subnet} with SG ${sg}"
+    openstack port create "$port" \
+      --network "$net_id" \
+      --fixed-ip "subnet=${sub_id}" \
+      --security-group "$sg" >/dev/null
+  fi
+  local port_id; port_id=$(openstack port show "$port" -f value -c id)
+
+  local args=( --flavor "$FLAVOR" --user-data "$user_data" --nic "port-id=${port_id}" )
+  # odaberi image ako nije zadan
+  if [[ -z "$IMAGE" ]]; then
+    IMAGE="$(openstack image list -f value -c Name | grep -E '^rhel-?9|rhel9|rhel-?8|rhel8|ubuntu-22\.04' | head -n1 || true)"
+    [[ -z "$IMAGE" ]] && IMAGE="$(openstack image list -f value -c Name | head -n1)"
+  fi
+  args+=( --image "$IMAGE" )
+  [[ -n "$KEYPAIR" ]] && args+=( --key-name "$KEYPAIR" )
+  if [[ "${BOOT_FROM_VOLUME}" == "true" ]]; then
+    args+=( --boot-from-volume "${BOOT_VOLUME_SIZE_GB}" )
+  fi
 
   echo "[i] Creating server $name (image: $IMAGE)"
   openstack server create "$name" "${args[@]}" >/dev/null
 
-  openstack server wait --active "$name" >/dev/null || true
+  wait_server_active "$name" 900 || { echo "[!] $name not ACTIVE, skipping volumes"; return 1; }
+
   for d in 1 2; do
     local vol="${name}-vol${d}"
+    echo "[i] Creating volume $vol (${VOL_SIZE_GB}GB)"
     openstack volume create --size "$VOL_SIZE_GB" "$vol" >/dev/null
-    openstack server add volume "$name" "$vol" >/dev/null
+    wait_volume_status "$vol" available 300 || true
+    echo "[i] Attaching $vol -> $name"
+    openstack server add volume "$name" "$vol" >/dev/null || true
+    wait_volume_status "$vol" in-use 300 || true
   done
 }
 
 assign_fip() {
   local server="$1"
-  local fip; fip=$(openstack floating ip create "$EXT_NET" -f value -c floating_ip_address)
+  local fip
+  fip=$(openstack floating ip create "$EXT_NET" -f value -c floating_ip_address)
   openstack server add floating ip "$server" "$fip" >/dev/null
   echo "$fip"
 }
@@ -267,39 +315,32 @@ assign_fip() {
 # Početak
 # ──────────────────────────────
 if [[ ! -f "$CSV_FILE" ]]; then
-  echo "Usage: $0 users.csv    (CSV: ime;prezime;rola)"
-  exit 1
+  echo "Usage: $0 users.csv    (CSV: ime;prezime;rola)"; exit 1
 fi
 
 echo "[i] Using external network: $EXT_NET"
 ensure_router
 ensure_hub_net
 
-# Odaberi image (auto ako nije zadan ili ne postoji)
-IMAGE="$(auto_pick_image "$IMAGE")"
-[[ -z "$IMAGE" ]] && { echo "[!] No suitable image found. Set IMAGE env var."; exit 1; }
-echo "[i] Selected image: $IMAGE"
+# Instruktorski SG (minimalan)
+ensure_sg "sg-instructor"
+ensure_rule "sg-instructor" egress "" "" ""
+# (po potrebi dodaj ingress pravila ako planiraš FIP na instruktorski VM)
 
-# Instruktorski SG
-if [[ -z "$(os_id security group sg-instructor)" ]]; then
-  openstack security group create sg-instructor >/dev/null
-  openstack security group rule create --egress sg-instructor >/dev/null || true
-fi
-
-# 1) Instruktorski VM-ovi (bez FIP-a)
+# Digni 1 instruktorski VM po roli 'instruktor' (bez FIP-a)
 while IFS=';' read -r ime prezime rola; do
   [[ -z "${ime:-}" ]] && continue
   [[ "${ime,,}" == "ime" ]] && continue
-  localname="$(safe "${ime}${prezime}")"
   role_lc="$(echo "${rola:-}" | tr '[:upper:]' '[:lower:]')"
-  if [[ "$role_lc" == "instruktor" ]]; then
-    ci=$(mktemp); make_cloud_init_jump "instr_${localname}" "$ci"
-    boot_server "instructor-${localname}" "$HUB_NET" "$HUB_SUBNET" "sg-instructor" "$ci"
-    rm -f "$ci"
-  fi
+  [[ "$role_lc" != "instruktor" ]] && continue
+
+  localname="$(safe "${ime}${prezime}")"
+  ci=$(mktemp); make_cloud_init_jump "instr_${localname}" "$ci"
+  boot_server "instructor-${localname}" "$HUB_NET" "$HUB_SUBNET" "sg-instructor" "$ci"
+  rm -f "$ci"
 done < "$CSV_FILE"
 
-# 2) Po studentu: mreža + SG + jump(FIP) + 1x WP (⇒ ukupno 2 VM-a po studentu)
+# Po studentu: mreže, SG, jump (s FIP) + 1 WP VM
 idx=1
 while IFS=';' read -r ime prezime rola; do
   [[ -z "${ime:-}" ]] && continue
@@ -313,18 +354,19 @@ while IFS=';' read -r ime prezime rola; do
   jump_cidr=$(jump_prefix "$idx")
   idx=$((idx+1))
 
-  echo "[i] Student ${ime} ${prezime} -> ${student} | app:${app_cidr} jump:${jump_cidr}"
+  echo "[i] Student ${ime} ${prezime} -> ${student} | VNet:${vnet_cidr} app:${app_cidr} jump:${jump_cidr}"
+
   create_network_for_student "$student" "$vnet_cidr" "$app_cidr" "$jump_cidr"
   create_secgroups_for_student "$student" "$app_cidr" "$jump_cidr"
 
-  # Jump + FIP
+  # Jump host s FIP
   jci=$(mktemp); make_cloud_init_jump "stud_${student}" "$jci"
   boot_server "jump-${student}" "stu-${student}-net" "jump-${student}-subnet" "sg-jump-${student}" "$jci"
   fip=$(assign_fip "jump-${student}")
   echo "[i] jump-${student} FIP: $fip"
   rm -f "$jci"
 
-  # Jedan WordPress VM (privatan)
+  # WordPress VM (privatan)
   wci=$(mktemp); make_cloud_init_wp "stud_${student}" "$wci"
   boot_server "wp-${student}-1" "stu-${student}-net" "app-${student}-subnet" "sg-app-${student}" "$wci"
   rm -f "$wci"
@@ -336,5 +378,5 @@ echo
 echo "Korisno:"
 echo "  openstack server list"
 echo "  openstack floating ip list"
-echo "  # SSH na jump: ssh ${ADMIN_USER}@<FIP>"
+echo "  # SSH na jump: ssh ${ADMIN_USER}@<FIP> (pass: ${LAB_PASSWORD})"
 echo "  # sa jump-a na WP: ssh ${ADMIN_USER}@<privatni-IP>"
