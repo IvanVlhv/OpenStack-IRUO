@@ -1,30 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ──────────────────────────────
-# Konfiguracija (editiraj po potrebi)
-# ──────────────────────────────
-CSV_FILE="${1:-users.csv}"          # CSV: ime;prezime;rola
-EXT_NET="${EXT_NET:-provider-datacentre}"  # external network (floating IP / router gw)
-IMAGE="${IMAGE:-}"                  # ako ostaviš prazno, auto-pickat će rhel9->rhel8->ubuntu-22.04
-FLAVOR="${FLAVOR:-default}"        # ~1 vCPU/1GB (prilagodi)
-VOL_SIZE_GB="${VOL_SIZE_GB:-5}"     # veličina svakog dodatnog diska
-ADMIN_USER="${ADMIN_USER:-admin}"  #admin korisnik na VM-ovima
-LAB_PASSWORD="${LAB_PASSWORD:-ChangeMe!123}"  # zajednički lab pass
-KEYPAIR="${KEYPAIR:-}"              # opciono: --key-name
+CSV_FILE="${1:-users.csv}"        
+EXT_NET="${EXT_NET:-provider-datacentre}"  
+IMAGE="${IMAGE:-rhel8}"                 
+FLAVOR="${FLAVOR:-default}"       
+VOL_SIZE_GB="${VOL_SIZE_GB:-5}"    
+ADMIN_USER="${ADMIN_USER:-admin}"
+LAB_PASSWORD="${LAB_PASSWORD:-Lozinka!123}"  
+KEYPAIR="${KEYPAIR:-}"             
 ROUTER_NAME="${ROUTER_NAME:-course-router}"
 BOOT_FROM_VOLUME="${BOOT_FROM_VOLUME:-false}"
 BOOT_VOLUME_SIZE_GB="${BOOT_VOLUME_SIZE_GB:-10}"
 
-# HUB mreža (instruktorski subnet; koristi se kao “whitelist” za pristup studentima)
 HUB_NET="hub-net"
 HUB_SUBNET="hub-subnet"
 HUB_CIDR="10.90.1.0/24"
 DNS_NS="${DNS_NS:-8.8.8.8}"
 
-# ──────────────────────────────
-# Helpers
-# ──────────────────────────────
+
 need_cmd(){ command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing command: $1"; exit 1; }; }
 need_cmd openstack; need_cmd awk; need_cmd sed; need_cmd tr; need_cmd mktemp
 
@@ -35,7 +29,7 @@ jump_prefix(){ local i="$1"; echo "10.91.${i}.128/26"; }
 
 os_id(){ openstack "$1" show "$2" -f value -c id 2>/dev/null || true; }
 
-# ---- čekanja ---------------------------------------------------------------
+
 wait_server_active(){
   local name="$1" timeout="${2:-900}" start=$(date +%s)
   echo "[i] Waiting for server $name to become ACTIVE..."
@@ -67,13 +61,11 @@ wait_volume_status(){
   return 0
 }
 
-# ---- SG helpers (idempotent + wait) ----------------------------------------
 ensure_sg(){
   local sg="$1"
   if [[ -z "$(os_id 'security group' "$sg")" ]]; then
     openstack security group create "$sg" >/dev/null
   fi
-  # pričekaj da se SG pojavi (race fix)
   for i in {1..20}; do
     openstack security group show "$sg" >/dev/null 2>&1 && return 0
     sleep 0.5
@@ -104,7 +96,7 @@ create_secgroups_for_student(){
   ensure_rule "$sg_app" egress  ""  ""  ""
 }
 
-# ---- mreža / router ---------------------------------------------------------
+# mreža
 ensure_router() {
   local rid
   rid=$(os_id router "$ROUTER_NAME")
@@ -159,7 +151,7 @@ create_network_for_student() {
   fi
 }
 
-# ---- cloud-init -------------------------------------------------------------
+# cloud-init 
 make_cloud_init_jump() {
   local studuser="$1" out="$2"
   cat > "$out" <<'CLOUD'
@@ -257,7 +249,7 @@ CLOUD
   sed -i "s|__PASS__|${LAB_PASSWORD}|g" "$out"
 }
 
-# ---- server boot preko PORTA (port-id) --------------------------------------
+# server boot
 boot_server() {
   local name="$1" net="$2" subnet="$3" sg="$4" user_data="$5"
 
@@ -311,9 +303,7 @@ assign_fip() {
   echo "$fip"
 }
 
-# ──────────────────────────────
-# Početak
-# ──────────────────────────────
+#-----
 if [[ ! -f "$CSV_FILE" ]]; then
   echo "Usage: $0 users.csv    (CSV: ime;prezime;rola)"; exit 1
 fi
@@ -322,12 +312,44 @@ echo "[i] Using external network: $EXT_NET"
 ensure_router
 ensure_hub_net
 
-# Instruktorski SG (minimalan)
+#wait_lb_active() {
+#  local lb="$1"
+#  while :; do
+#    st=$(openstack loadbalancer show "$lb" -f value -c provisioning_status 2>/dev/null || echo ERROR)
+#    [[ "$st" == "ACTIVE" ]] && break
+#    sleep 3
+#  done
+#}
+
+#create_lb_for_student() {
+#  local student="$1"
+#  local app_sn="app-${student}-subnet"
+#  local lb="lb-${student}" ls="http-${student}" pool="pool-${student}" hm="hm-${student}"
+#  local app_subnet_id
+#  app_subnet_id=$(openstack subnet show "$app_sn" -f value -c id)
+#  echo "[i] Creating LB for $student"
+
+#  openstack loadbalancer create --name "$lb" --vip-subnet-id "$app_subnet_id" >/dev/null
+#  wait_lb_active "$lb"
+#  openstack loadbalancer listener create --name "$ls" --protocol HTTP --protocol-port 80 "$lb" >/dev/null
+#  openstack loadbalancer pool create --name "$pool" --lb-algorithm ROUND_ROBIN --listener "$ls" --protocol HTTP >/dev/null
+#  openstack loadbalancer healthmonitor create --name "$hm" --delay 5 --timeout 3 --max-retries 3 --type HTTP --url-path / "$pool" >/dev/null
+# for vm in $(openstack server list -f value -c Name | grep "^wp-${student}-"); do
+#    ip=$(openstack server show "$vm" -f value -c addresses | sed -E 's/.*=([0-9.]+).*/\1/')
+#    openstack loadbalancer member create --subnet-id "$app_subnet_id" \
+#      --address "$ip" --protocol-port 80 "$pool" >/dev/null
+#  done
+#  wait_lb_active "$lb"
+#  vip=$(openstack loadbalancer show "$lb" -f value -c vip_address)
+#  echo "[i] LB VIP for ${student}: $vip"
+#}
+
+
+#INSTRUKTOR
 ensure_sg "sg-instructor"
 ensure_rule "sg-instructor" egress "" "" ""
-# (po potrebi dodaj ingress pravila ako planiraš FIP na instruktorski VM)
 
-# Digni 1 instruktorski VM po roli 'instruktor' (bez FIP-a)
+
 while IFS=';' read -r ime prezime rola; do
   [[ -z "${ime:-}" ]] && continue
   [[ "${ime,,}" == "ime" ]] && continue
@@ -340,7 +362,7 @@ while IFS=';' read -r ime prezime rola; do
   rm -f "$ci"
 done < "$CSV_FILE"
 
-# Po studentu: mreže, SG, jump (s FIP) + 1 WP VM
+#S+TUDENTI
 idx=1
 while IFS=';' read -r ime prezime rola; do
   [[ -z "${ime:-}" ]] && continue
